@@ -1,313 +1,905 @@
-:root {
-  --ink: #0e0d0b;
-  --ink-2: #18160f;
-  --ink-3: #24211a;
-  --line: #3a352a;
-  --paper: #f1e9d8;
-  --muted: #a99f8a;
-  --acid: #d4ff3a;
-  --ember: #ff6a3d;
-  --ok: #7be0a6;
-  --display: "Fraunces", Georgia, serif;
-  --sans: "IBM Plex Sans", system-ui, sans-serif;
-  --mono: "IBM Plex Mono", ui-monospace, monospace;
+import {
+  AuthError,
+  MissingIdentityError,
+  getUser,
+  handleAuthCallback,
+  login,
+  logout,
+  onAuthChange,
+  requestPasswordRecovery,
+  signup,
+  updateUser,
+  type User,
+} from "@netlify/identity";
+
+type Resource = "artists" | "releases" | "tracks";
+type Row = Record<string, any> & { id: number };
+
+type Field = {
+  name: string;
+  label: string;
+  type?: "text" | "code" | "textarea" | "date" | "number" | "checkbox" | "select" | "artist" | "release";
+  hint?: string;
+  placeholder?: string;
+  required?: boolean;
+  full?: boolean;
+  options?: [string, string][];
+};
+
+type QualityIssue = {
+  resource: Resource;
+  rowId: number | null;
+  title: string;
+  message: string;
+  severity: "error" | "warning" | "info";
+};
+
+type DistributionTarget = "Spotify" | "Apple Music" | "Amazon Music" | "YouTube Music" | "Tidal" | "Deezer" | "Qobuz";
+type ReleaseStatus = "draft" | "review" | "approved" | "submitted" | "live";
+type DeliveryStatus = "draft" | "review" | "approved" | "submitted" | "live";
+
+const app = document.querySelector<HTMLDivElement>("#app")!;
+
+const DSP_TARGETS: DistributionTarget[] = ["Spotify", "Apple Music", "Amazon Music", "YouTube Music", "Tidal", "Deezer", "Qobuz"];
+const WORKFLOW_STATES: [ReleaseStatus, string][] = [
+  ["draft", "Draft"],
+  ["review", "In review"],
+  ["approved", "Approved"],
+  ["submitted", "Submitted"],
+  ["live", "Live"],
+];
+const TERRITORIES: [string, string][] = [
+  ["worldwide", "Worldwide"],
+  ["us", "US"],
+  ["ca", "Canada"],
+  ["eu", "Europe"],
+  ["uk", "UK"],
+  ["latam", "LATAM"],
+  ["apac", "APAC"],
+];
+
+const state = {
+  user: null as User | null,
+  tab: "tracks" as Resource,
+  query: "",
+  data: { artists: [], releases: [], tracks: [] } as Record<Resource, Row[]>,
+  loaded: false,
+};
+
+const esc = (v: unknown) =>
+  String(v ?? "").replace(/[&<>\"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]!);
+
+const authMessage = (error: unknown) => {
+  if (error instanceof MissingIdentityError) return "Accounts aren't available here yet. Try again on the deployed site.";
+  if (error instanceof AuthError) {
+    if (error.status === 401) return "Invalid email or password.";
+    if (error.status === 403) return "Signups are currently closed.";
+    return error.message;
+  }
+  return "Something went wrong. Please try again.";
+};
+
+// ---------- metadata definitions ----------
+
+const RELEASE_TYPES: [string, string][] = [
+  ["single", "Single"],
+  ["ep", "EP"],
+  ["album", "Album"],
+  ["compilation", "Compilation"],
+];
+
+const FIELDS: Record<Resource, Field[]> = {
+  artists: [
+    { name: "name", label: "Artist / stage name", required: true },
+    { name: "legalName", label: "Legal name" },
+    { name: "ipi", label: "IPI name number", type: "code", placeholder: "00123456789", hint: "From your PRO. 9–11 digits." },
+    { name: "isni", label: "ISNI", type: "code", placeholder: "0000 0001 2345 6789", hint: "16 characters." },
+    { name: "pro", label: "Performing rights org", placeholder: "ASCAP, BMI, PRS, SOCAN…" },
+    { name: "spotifyUrl", label: "Spotify artist URL" },
+    { name: "appleMusicUrl", label: "Apple Music artist URL", full: true },
+    { name: "bio", label: "Short bio", type: "textarea", full: true },
+  ],
+  releases: [
+    { name: "title", label: "Release title", required: true, full: true },
+    { name: "artistId", label: "Primary artist", type: "artist" },
+    { name: "releaseType", label: "Type", type: "select", options: RELEASE_TYPES },
+    { name: "upc", label: "UPC / EAN", type: "code", placeholder: "012345678905", hint: "12 or 13 digits, from your distributor." },
+    { name: "releaseDate", label: "Release date", type: "date" },
+    { name: "label", label: "Label / imprint", full: true },
+    { name: "status", label: "Workflow status", type: "select", options: WORKFLOW_STATES },
+    { name: "territory", label: "Territory", type: "select", options: TERRITORIES },
+    { name: "rightsOwner", label: "Rights owner / admin", full: true, placeholder: "Artist, label, publisher, or admin" },
+    { name: "approvalNote", label: "Approval note", type: "textarea", full: true, placeholder: "Optional review note for clearance or admin approval" },
+  ],
+  tracks: [
+    { name: "title", label: "Track title", required: true, full: true },
+    { name: "artistId", label: "Primary artist", type: "artist" },
+    { name: "releaseId", label: "Release", type: "release" },
+    { name: "isrc", label: "ISRC", type: "code", placeholder: "US-S1Z-24-00001", hint: "Identifies this specific recording." },
+    { name: "iswc", label: "ISWC", type: "code", placeholder: "T-123.456.789-0", hint: "Identifies the underlying composition." },
+    { name: "durationSeconds", label: "Duration (seconds)", type: "number" },
+    { name: "genre", label: "Genre" },
+    { name: "writers", label: "Writers / splits", type: "textarea", full: true, placeholder: "Jane Doe 50%, John Roe 50%" },
+    { name: "creditOwner", label: "Credit owner / publisher", full: true, placeholder: "Who owns the admin rights to this master or composition" },
+    { name: "deliveryStatus", label: "Delivery status", type: "select", options: WORKFLOW_STATES },
+    { name: "explicit", label: "Explicit lyrics", type: "checkbox", full: true },
+  ],
+};
+
+const LABELS: Record<Resource, [string, string]> = {
+  artists: ["Artists", "artist"],
+  releases: ["Releases", "release"],
+  tracks: ["Tracks", "track"],
+};
+
+// Codes that distributors and PROs typically ask for.
+const KEY_CODES: Record<Resource, [string, string][]> = {
+  artists: [["ipi", "IPI"], ["isni", "ISNI"]],
+  releases: [["upc", "UPC"]],
+  tracks: [["isrc", "ISRC"], ["iswc", "ISWC"]],
+};
+
+const fmtIsrc = (v: string) => (v.length === 12 ? `${v.slice(0, 2)}-${v.slice(2, 5)}-${v.slice(5, 7)}-${v.slice(7)}` : v);
+const fmtIsni = (v: string) => v.replace(/(.{4})(?=.)/g, "$1 ");
+const fmtIswc = (v: string) => (v.length === 11 ? `${v[0]}-${v.slice(1, 4)}.${v.slice(4, 7)}.${v.slice(7, 10)}-${v[10]}` : v);
+const FORMAT: Record<string, (v: string) => string> = { isrc: fmtIsrc, isni: fmtIsni, iswc: fmtIswc };
+const fmtDuration = (s: number) => `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`;
+
+const statusLabel = (value?: string) => {
+  const match = WORKFLOW_STATES.find(([key]) => key === value);
+  return match ? match[1] : "Draft";
+};
+
+const nameOf = (resource: Resource, id: number | null) => {
+  if (!id) return null;
+  const row = state.data[resource].find((r) => r.id === id);
+  return row ? row.name ?? row.title : null;
+};
+
+const missingCount = (resource: Resource) =>
+  state.data[resource].reduce((n, row) => n + KEY_CODES[resource].filter(([k]) => !row[k]).length, 0);
+
+const normalizeValue = (value: unknown) => String(value ?? "").trim();
+const normalizeCode = (value: unknown) => normalizeValue(value).replace(/[\s.\-]/g, "").toUpperCase();
+
+function parseWriterSplits(value: unknown): number[] {
+  const text = normalizeValue(value);
+  if (!text) return [];
+  const matches = [...text.matchAll(/(\d+(?:\.\d+)?)\s*%/g)];
+  if (!matches.length) return [];
+  return matches.map((match) => Number(match[1]));
 }
 
-* { box-sizing: border-box; }
+function summarizeOperations() {
+  const totalReleases = state.data.releases.length;
+  const draft = state.data.releases.filter((release) => !release.status || release.status === "draft").length;
+  const readyForDistribution = state.data.releases.filter((release) => ["review", "approved", "submitted", "live"].includes(release.status)).length;
+  const submitted = state.data.tracks.filter((track) => ["submitted", "live"].includes(track.deliveryStatus)).length;
+  const rightsPending = state.data.tracks.filter((track) => !track.writers || parseWriterSplits(track.writers).length === 0).length;
+  const live = state.data.tracks.filter((track) => track.deliveryStatus === "live").length;
 
-body {
-  margin: 0;
-  min-height: 100vh;
-  background:
-    radial-gradient(1200px 600px at 110% -10%, #2a2a10 0%, transparent 60%),
-    radial-gradient(800px 500px at -10% 110%, #2b1409 0%, transparent 60%),
-    var(--ink);
-  color: var(--paper);
-  font-family: var(--sans);
-  font-size: 15px;
-  line-height: 1.5;
-}
-
-body::before {
-  content: "";
-  position: fixed;
-  inset: 0;
-  pointer-events: none;
-  opacity: 0.06;
-  background-image: repeating-linear-gradient(0deg, #fff 0 1px, transparent 1px 3px);
+  return {
+    totalReleases,
+    readyForDistribution,
+    draft,
+    submitted,
+    rightsPending,
+    live,
+  };
 }
 
-.boot { padding: 4rem; color: var(--muted); font-family: var(--mono); }
-
-button, input, select, textarea { font: inherit; color: inherit; }
-
-button {
-  cursor: pointer;
-  border: 1px solid var(--line);
-  background: var(--ink-3);
-  padding: 0.55rem 1rem;
-  border-radius: 999px;
-  transition: background 0.15s, border-color 0.15s, color 0.15s;
-}
-button:hover { border-color: var(--paper); }
-button.primary { background: var(--acid); color: var(--ink); border-color: var(--acid); font-weight: 600; }
-button.primary:hover { background: #e6ff7a; }
-button.ghost { background: transparent; }
-button.danger:hover { border-color: var(--ember); color: var(--ember); }
-button:disabled { opacity: 0.5; cursor: wait; }
-
-label { display: grid; gap: 0.3rem; font-size: 0.8rem; color: var(--muted); letter-spacing: 0.02em; }
-label.check { display: flex; align-items: center; gap: 0.5rem; color: var(--paper); font-size: 0.9rem; }
-input, select, textarea {
-  background: var(--ink);
-  border: 1px solid var(--line);
-  border-radius: 10px;
-  padding: 0.6rem 0.75rem;
-  font-size: 0.95rem;
-}
-input:focus, select:focus, textarea:focus { outline: 2px solid var(--acid); outline-offset: 1px; border-color: transparent; }
-input.code { font-family: var(--mono); text-transform: uppercase; letter-spacing: 0.04em; }
-textarea { min-height: 5rem; resize: vertical; }
-.hint { font-size: 0.72rem; color: #7d745f; }
-
-/* ---------- auth ---------- */
-.auth {
-  min-height: 100vh;
-  display: grid;
-  grid-template-columns: 1.2fr 1fr;
-}
-.auth-hero {
-  padding: clamp(2rem, 6vw, 5rem);
-  display: flex;
-  flex-direction: column;
-  justify-content: space-between;
-  border-right: 1px solid var(--line);
-}
-.brand { font-family: var(--mono); font-size: 0.8rem; letter-spacing: 0.2em; text-transform: uppercase; color: var(--acid); }
-.auth-hero h1 {
-  font-family: var(--display);
-  font-weight: 900;
-  font-size: clamp(2.8rem, 6vw, 5.5rem);
-  line-height: 0.95;
-  letter-spacing: -0.03em;
-  margin: 2rem 0 1.5rem;
-}
-.auth-hero h1 em { font-style: italic; font-weight: 400; color: var(--acid); }
-.auth-hero p { max-width: 34rem; color: var(--muted); font-size: 1.05rem; }
-.codes { display: flex; flex-wrap: wrap; gap: 0.5rem; margin-top: 2rem; }
-.codes span {
-  font-family: var(--mono);
-  font-size: 0.78rem;
-  border: 1px solid var(--line);
-  border-radius: 6px;
-  padding: 0.25rem 0.6rem;
-  color: var(--paper);
-}
-.auth-panel { display: grid; place-items: center; padding: 2rem; }
-.auth-card { width: min(380px, 100%); display: grid; gap: 1rem; }
-.auth-card h2 { font-family: var(--display); font-size: 2rem; margin: 0; }
-.tabs { display: flex; gap: 0.25rem; padding: 0.25rem; background: var(--ink-2); border: 1px solid var(--line); border-radius: 999px; width: fit-content; }
-.tabs button { border: none; background: transparent; padding: 0.4rem 1rem; color: var(--muted); }
-.tabs button.active { background: var(--paper); color: var(--ink); }
-.linkish { background: none; border: none; padding: 0; color: var(--muted); text-decoration: underline; font-size: 0.85rem; justify-self: start; }
-.msg { font-size: 0.88rem; padding: 0.6rem 0.8rem; border-radius: 10px; }
-.msg.error { background: #3a140b; color: #ffb39b; }
-.msg.info { background: #1f2a0b; color: #dfffa0; }
-
-/* ---------- app shell ---------- */
-.shell { max-width: 1200px; margin: 0 auto; padding: 1.5rem clamp(1rem, 4vw, 2.5rem) 4rem; }
-.topbar { display: flex; align-items: center; justify-content: space-between; gap: 1rem; padding-bottom: 1.25rem; border-bottom: 1px solid var(--line); }
-.topbar .who { display: flex; align-items: center; gap: 0.75rem; color: var(--muted); font-size: 0.88rem; }
-.hello { margin: 2.5rem 0 1.5rem; }
-.hello h1 { font-family: var(--display); font-weight: 900; font-size: clamp(2.2rem, 5vw, 3.6rem); line-height: 1; margin: 0; letter-spacing: -0.02em; }
-.hello p { color: var(--muted); margin: 0.6rem 0 0; }
-
-.stats { display: grid; grid-template-columns: repeat(4, 1fr); gap: 1px; background: var(--line); border: 1px solid var(--line); border-radius: 16px; overflow: hidden; margin-bottom: 2rem; }
-.stat { background: var(--ink-2); padding: 1.1rem 1.25rem; }
-.stat b { display: block; font-family: var(--display); font-size: 2.2rem; line-height: 1; }
-.stat span { font-size: 0.78rem; color: var(--muted); text-transform: uppercase; letter-spacing: 0.08em; }
-.stat.warn b { color: var(--ember); }
-.stat.good b { color: var(--ok); }
-
-.quality-panel,
-.ops-panel,
-.sync-panel {
-  background: var(--ink-2);
-  border: 1px solid var(--line);
-  border-radius: 18px;
-  padding: 1.25rem 1.3rem 1rem;
-  margin-bottom: 1.5rem;
-}
-.quality-header,
-.ops-header,
-.sync-header {
-  display: flex;
-  justify-content: space-between;
-  align-items: end;
-  gap: 1rem;
-  margin-bottom: 1rem;
-}
-.eyebrow {
-  margin: 0 0 0.15rem;
-  font-family: var(--mono);
-  font-size: 0.72rem;
-  letter-spacing: 0.12em;
-  text-transform: uppercase;
-  color: var(--muted);
-}
-.quality-header h2,
-.ops-header h3,
-.sync-header h3 {
-  margin: 0;
-  font-family: var(--display);
-  font-size: clamp(1.5rem, 3vw, 2.2rem);
-}
-.ops-header span {
-  color: var(--muted);
-  font-size: 0.82rem;
-}
-.quality-actions { display: flex; gap: 0.5rem; flex-wrap: wrap; }
-.quality-grid,
-.ops-grid,
-.sync-grid {
-  display: grid;
-  gap: 0.75rem;
-}
-.quality-grid { grid-template-columns: repeat(5, minmax(0, 1fr)); }
-.ops-grid { grid-template-columns: repeat(4, minmax(0, 1fr)); }
-.sync-grid { grid-template-columns: repeat(7, minmax(0, 1fr)); }
-.quality-card,
-.ops-card,
-.sync-chip {
-  background: var(--ink);
-  border: 1px solid var(--line);
-  border-radius: 14px;
-  padding: 1rem;
-  display: grid;
-  gap: 0.2rem;
-  text-align: center;
-}
-.quality-card b,
-.ops-card strong {
-  font-family: var(--display);
-  font-size: 2rem;
-  line-height: 1;
-}
-.quality-card span,
-.ops-card span {
-  color: var(--muted);
-  text-transform: uppercase;
-  letter-spacing: 0.08em;
-  font-size: 0.72rem;
-}
-.quality-card.good b { color: var(--ok); }
-.quality-card.warn b { color: var(--ember); }
-.ops-card.draft strong { color: var(--muted); }
-.ops-card.ready strong { color: var(--ok); }
-.ops-card.submitted strong { color: var(--acid); }
-.ops-card.live strong { color: var(--paper); }
-.sync-chip {
-  font-family: var(--mono);
-  font-size: 0.72rem;
-  letter-spacing: 0.04em;
-  padding: 0.8rem 0.6rem;
-  color: var(--paper);
-}
-.sync-chip.ready { border-color: rgba(123,224,166,0.45); background: rgba(123,224,166,0.08); }
-.sync-chip.needs-review { border-color: rgba(255,106,61,0.5); background: rgba(255,106,61,0.08); }
-.quality-issues {
-  display: grid;
-  gap: 0.55rem;
-  margin-top: 1rem;
-}
-.issue {
-  display: flex;
-  align-items: center;
-  gap: 0.7rem;
-  padding: 0.65rem 0.8rem;
-  border-radius: 10px;
-  border: 1px solid var(--line);
-  background: rgba(255,255,255,0.02);
-}
-.issue strong {
-  min-width: 86px;
-  font-family: var(--mono);
-  letter-spacing: 0.08em;
-  text-transform: uppercase;
-  font-size: 0.7rem;
-  color: var(--paper);
-}
-.issue.error { border-color: rgba(255, 106, 61, 0.6); background: rgba(255, 106, 61, 0.08); }
-.issue.warning { border-color: rgba(212, 255, 58, 0.4); background: rgba(212, 255, 58, 0.06); }
-.issue.info { border-color: rgba(123, 224, 166, 0.5); background: rgba(123, 224, 166, 0.06); }
-
-.nav { display: flex; gap: 0.5rem; margin-bottom: 1.25rem; align-items: center; flex-wrap: wrap; }
-.nav .spacer { flex: 1; }
-.nav button.tab { background: transparent; border-color: transparent; font-family: var(--display); font-size: 1.35rem; padding: 0.2rem 0.8rem; color: var(--muted); }
-.nav button.tab.active { color: var(--paper); border-color: var(--line); background: var(--ink-2); }
-.nav button.tab small { font-family: var(--mono); font-size: 0.7rem; margin-left: 0.3rem; color: var(--acid); }
-.search { min-width: 220px; border-radius: 999px; }
-
-.list { display: grid; gap: 0.6rem; }
-.row {
-  display: grid;
-  grid-template-columns: 1fr auto;
-  gap: 1rem;
-  align-items: center;
-  background: var(--ink-2);
-  border: 1px solid var(--line);
-  border-radius: 14px;
-  padding: 1rem 1.2rem;
-  transition: border-color 0.15s, transform 0.15s;
-}
-.row:hover { border-color: #5a5240; }
-.row h3 { margin: 0; font-family: var(--display); font-size: 1.25rem; font-weight: 700; }
-.row .sub { color: var(--muted); font-size: 0.85rem; margin-top: 0.15rem; }
-.chips { display: flex; flex-wrap: wrap; gap: 0.4rem; margin-top: 0.6rem; }
-.chip { font-family: var(--mono); font-size: 0.75rem; border-radius: 6px; padding: 0.15rem 0.5rem; background: var(--ink); border: 1px solid var(--line); }
-.chip b { color: var(--muted); font-weight: 500; margin-right: 0.35rem; }
-.chip.missing { border-style: dashed; color: var(--ember); border-color: #6b2e1c; }
-.chip.flag { background: var(--ember); color: var(--ink); border-color: var(--ember); }
-.actions { display: flex; gap: 0.4rem; }
-.actions button { padding: 0.35rem 0.8rem; font-size: 0.82rem; }
-
-.empty { border: 1px dashed var(--line); border-radius: 16px; padding: 3rem 1.5rem; text-align: center; color: var(--muted); }
-.empty h3 { font-family: var(--display); color: var(--paper); font-size: 1.5rem; margin: 0 0 0.4rem; }
-
-/* ---------- dialog ---------- */
-dialog {
-  border: 1px solid var(--line);
-  background: var(--ink-2);
-  color: var(--paper);
-  border-radius: 20px;
-  padding: 0;
-  width: min(640px, calc(100vw - 2rem));
-}
-dialog::backdrop { background: rgba(5, 5, 3, 0.75); backdrop-filter: blur(3px); }
-dialog form { padding: 1.5rem; display: grid; gap: 1rem; }
-dialog h2 { font-family: var(--display); margin: 0; font-size: 1.8rem; }
-.grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 0.9rem; }
-.grid2 .full { grid-column: 1 / -1; }
-.dialog-actions { display: flex; justify-content: flex-end; gap: 0.5rem; }
-
-@media (max-width: 860px) {
-  .auth { grid-template-columns: 1fr; }
-  .auth-hero { border-right: none; border-bottom: 1px solid var(--line); }
-  .stats { grid-template-columns: repeat(2, 1fr); }
-  .quality-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-  .ops-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-  .sync-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-  .grid2 { grid-template-columns: 1fr; }
-  .row { grid-template-columns: 1fr; }
+function validateArtist(row: Row): QualityIssue[] {
+  const issues: QualityIssue[] = [];
+  if (!row.name) issues.push({ resource: "artists", rowId: row.id, title: row.name ?? "Unnamed artist", message: "Artist name is required.", severity: "error" });
+  if (row.ipi && !/^\d{9,11}$/.test(normalizeCode(row.ipi))) {
+    issues.push({ resource: "artists", rowId: row.id, title: row.name ?? "Unnamed artist", message: "IPI should be 9-11 digits.", severity: "error" });
+  }
+  if (row.isni && !/^\d{15}[\dX]$/.test(normalizeCode(row.isni))) {
+    issues.push({ resource: "artists", rowId: row.id, title: row.name ?? "Unnamed artist", message: "ISNI should be 16 characters with digits/X.", severity: "error" });
+  }
+  if (!row.pro) {
+    issues.push({ resource: "artists", rowId: row.id, title: row.name ?? "Unnamed artist", message: "Add the PRO or performing rights organization for DSP readiness.", severity: "warning" });
+  }
+  if (row.spotifyUrl && !/^https?:\/\/.*spotify.*$/i.test(row.spotifyUrl)) {
+    issues.push({ resource: "artists", rowId: row.id, title: row.name ?? "Unnamed artist", message: "Spotify URL looks malformed.", severity: "warning" });
+  }
+  return issues;
 }
 
-@media (max-width: 520px) {
-  .quality-header,
-  .ops-header,
-  .sync-header { flex-direction: column; align-items: flex-start; }
-  .quality-grid,
-  .ops-grid,
-  .sync-grid { grid-template-columns: 1fr; }
+function validateRelease(row: Row): QualityIssue[] {
+  const issues: QualityIssue[] = [];
+  if (!row.title) issues.push({ resource: "releases", rowId: row.id, title: row.title ?? "Untitled release", message: "Release title is required.", severity: "error" });
+  if (!row.artistId) {
+    issues.push({ resource: "releases", rowId: row.id, title: row.title ?? "Untitled release", message: "Primary artist is required for release delivery.", severity: "warning" });
+  }
+  if (row.upc && !/^\d{12,13}$/.test(normalizeCode(row.upc))) {
+    issues.push({ resource: "releases", rowId: row.id, title: row.title ?? "Untitled release", message: "UPC/EAN should contain 12 or 13 digits.", severity: "error" });
+  }
+  if (!row.upc) {
+    issues.push({ resource: "releases", rowId: row.id, title: row.title ?? "Untitled release", message: "Add a UPC/EAN before distribution to the stores.", severity: "warning" });
+  }
+  if (row.releaseDate && !/^\d{4}-\d{2}-\d{2}$/.test(String(row.releaseDate))) {
+    issues.push({ resource: "releases", rowId: row.id, title: row.title ?? "Untitled release", message: "Release date should use YYYY-MM-DD.", severity: "error" });
+  }
+  if (!row.status || row.status === "draft") {
+    issues.push({ resource: "releases", rowId: row.id, title: row.title ?? "Untitled release", message: "Set a release workflow state to move this project out of draft mode.", severity: "info" });
+  }
+  return issues;
 }
 
-"}]}  ,
+function validateTrack(row: Row): QualityIssue[] {
+  const issues: QualityIssue[] = [];
+  if (!row.title) issues.push({ resource: "tracks", rowId: row.id, title: row.title ?? "Untitled track", message: "Track title is required.", severity: "error" });
+  if (!row.artistId) {
+    issues.push({ resource: "tracks", rowId: row.id, title: row.title ?? "Untitled track", message: "Assign the primary artist before delivering this track.", severity: "warning" });
+  }
+  if (!row.releaseId) {
+    issues.push({ resource: "tracks", rowId: row.id, title: row.title ?? "Untitled track", message: "Attach the release so DSP metadata can be assembled correctly.", severity: "warning" });
+  }
+  if (row.isrc && !/^[A-Z]{2}[A-Z0-9]{3}\d{7}$/.test(normalizeCode(row.isrc))) {
+    issues.push({ resource: "tracks", rowId: row.id, title: row.title ?? "Untitled track", message: "ISRC format is invalid.", severity: "error" });
+  }
+  if (!row.isrc) {
+    issues.push({ resource: "tracks", rowId: row.id, title: row.title ?? "Untitled track", message: "Need an ISRC for direct DSP submission and DDEX output.", severity: "warning" });
+  }
+  if (row.iswc && !/^T\d{10}$/.test(normalizeCode(row.iswc))) {
+    issues.push({ resource: "tracks", rowId: row.id, title: row.title ?? "Untitled track", message: "ISWC format is invalid.", severity: "error" });
+  }
+  if (row.durationSeconds != null && (!Number.isFinite(Number(row.durationSeconds)) || Number(row.durationSeconds) < 0)) {
+    issues.push({ resource: "tracks", rowId: row.id, title: row.title ?? "Untitled track", message: "Duration must be a non-negative number of seconds.", severity: "error" });
+  }
+  const writerSplits = parseWriterSplits(row.writers);
+  if (writerSplits.length) {
+    const total = writerSplits.reduce((sum, value) => sum + value, 0);
+    if (Math.abs(total - 100) > 0.001) {
+      issues.push({ resource: "tracks", rowId: row.id, title: row.title ?? "Untitled track", message: "Writer split total should equal 100%.", severity: "warning" });
+    }
+  } else if (row.writers) {
+    issues.push({ resource: "tracks", rowId: row.id, title: row.title ?? "Untitled track", message: "Writer credits were entered without a percentage split. Add % values for rights clarity.", severity: "info" });
+  } else {
+    issues.push({ resource: "tracks", rowId: row.id, title: row.title ?? "Untitled track", message: "Add writer and split data before sending to DDEX or DSPs.", severity: "warning" });
+  }
+  if (!row.creditOwner) {
+    issues.push({ resource: "tracks", rowId: row.id, title: row.title ?? "Untitled track", message: "Assign the publisher or credit owner for rights administration.", severity: "warning" });
+  }
+  return issues;
+}
+
+function summarizeQuality(): {
+  issues: QualityIssue[];
+  total: number;
+  errors: number;
+  warnings: number;
+  info: number;
+  readiness: number;
+  blockers: number;
+  dspReadiness: number;
+  rightsReadiness: number;
+} {
+  const issues: QualityIssue[] = [];
+  for (const resource of ["artists", "releases", "tracks"] as Resource[]) {
+    for (const row of state.data[resource]) {
+      if (resource === "artists") issues.push(...validateArtist(row));
+      if (resource === "releases") issues.push(...validateRelease(row));
+      if (resource === "tracks") issues.push(...validateTrack(row));
+    }
+  }
+
+  const errors = issues.filter((issue) => issue.severity === "error").length;
+  const warnings = issues.filter((issue) => issue.severity === "warning").length;
+  const info = issues.filter((issue) => issue.severity === "info").length;
+  const total = issues.length;
+  const totalRows = state.data.artists.length + state.data.releases.length + state.data.tracks.length;
+  const readiness = totalRows === 0 ? 100 : Math.max(0, Math.min(100, Math.round(((totalRows * 3 - total) / (totalRows * 3)) * 100)));
+
+  const dspRequired = state.data.tracks.length * 2;
+  const dspComplete = state.data.tracks.filter((track) => track.isrc && track.artistId && track.releaseId).length;
+  const dspReadiness = dspRequired === 0 ? 100 : Math.max(0, Math.min(100, Math.round((dspComplete / dspRequired) * 100)));
+
+  const rightsComplete = state.data.tracks.filter((track) => track.writers && parseWriterSplits(track.writers).length && track.creditOwner).length;
+  const rightsReadiness = state.data.tracks.length === 0 ? 100 : Math.max(0, Math.min(100, Math.round((rightsComplete / state.data.tracks.length) * 100)));
+
+  return { issues, total, errors, warnings, info, readiness, blockers: errors, dspReadiness, rightsReadiness };
+}
+
+function exportDDEXBundle() {
+  const quality = summarizeQuality();
+  const ops = summarizeOperations();
+  return {
+    schemaVersion: "1.0",
+    messageType: "ReleaseNotification",
+    createdAt: new Date().toISOString(),
+    source: "Strezless Nexus",
+    workflow: {
+      status: quality.blockers === 0 ? "ready-for-distribution" : "needs-review",
+      readiness: quality.readiness,
+      dspReadiness: quality.dspReadiness,
+      rightsReadiness: quality.rightsReadiness,
+      releaseQueue: {
+        draft: ops.draft,
+        readyForDistribution: ops.readyForDistribution,
+        submitted: ops.submitted,
+        live: ops.live,
+      },
+    },
+    validation: {
+      readiness: quality.readiness,
+      totalIssues: quality.total,
+      errors: quality.errors,
+      warnings: quality.warnings,
+      info: quality.info,
+      blockers: quality.blockers,
+    },
+    rights: {
+      defaultTerritory: "Worldwide",
+      territories: ["World"],
+      defaultStatus: quality.blockers === 0 ? "approved" : "needs-review",
+      rightsPending: ops.rightsPending,
+      admin: "Independent / label-managed",
+      releaseCoverage: state.data.releases.map((release) => ({
+        releaseId: release.id,
+        title: release.title,
+        territory: release.territory ?? "worldwide",
+        rightsOwner: release.rightsOwner ?? "Unassigned",
+        status: release.status ?? "draft",
+      })),
+    },
+    distributionTargets: DSP_TARGETS,
+    artists: state.data.artists.map((artist) => ({
+      id: artist.id,
+      name: artist.name,
+      legalName: artist.legalName ?? null,
+      ipi: artist.ipi ?? null,
+      isni: artist.isni ?? null,
+      pro: artist.pro ?? null,
+      spotifyUrl: artist.spotifyUrl ?? null,
+      appleMusicUrl: artist.appleMusicUrl ?? null,
+      bio: artist.bio ?? null,
+    })),
+    releases: state.data.releases.map((release) => ({
+      id: release.id,
+      title: release.title,
+      artistId: release.artistId ?? null,
+      releaseType: release.releaseType ?? "single",
+      upc: release.upc ?? null,
+      label: release.label ?? null,
+      releaseDate: release.releaseDate ?? null,
+      status: release.status ?? "draft",
+      territory: release.territory ?? "worldwide",
+      rightsOwner: release.rightsOwner ?? null,
+      approvalNote: release.approvalNote ?? null,
+    })),
+    tracks: state.data.tracks.map((track) => ({
+      id: track.id,
+      title: track.title,
+      artistId: track.artistId ?? null,
+      releaseId: track.releaseId ?? null,
+      isrc: track.isrc ?? null,
+      iswc: track.iswc ?? null,
+      durationSeconds: track.durationSeconds ?? null,
+      genre: track.genre ?? null,
+      writers: track.writers ?? null,
+      creditOwner: track.creditOwner ?? null,
+      deliveryStatus: track.deliveryStatus ?? "draft",
+      explicit: Boolean(track.explicit),
+      distributionTargets: DSP_TARGETS,
+    })),
+  };
+}
+
+function downloadTextFile(filename: string, content: string, type: string) {
+  const blob = new Blob([content], { type });
+  const url = URL.createObjectURL(blob);
+  const anchor = document.createElement("a");
+  anchor.href = url;
+  anchor.download = filename;
+  document.body.appendChild(anchor);
+  anchor.click();
+  anchor.remove();
+  URL.revokeObjectURL(url);
+}
+
+function exportDDEX() {
+  const payload = exportDDEXBundle();
+  downloadTextFile("strezless-nexus-ddex.json", JSON.stringify(payload, null, 2), "application/json");
+}
+
+function exportCsv() {
+  const rows: Array<Record<string, string | number | null>> = [];
+  for (const resource of ["artists", "releases", "tracks"] as Resource[]) {
+    for (const row of state.data[resource]) {
+      rows.push({
+        resource,
+        id: row.id,
+        title: row.title ?? row.name ?? "",
+        artist: row.artistId ? (nameOf("artists", row.artistId) ?? "") : "",
+        release: row.releaseId ? (nameOf("releases", row.releaseId) ?? "") : "",
+        status: summarizeQuality().blockers > 0 ? "needs-review" : "ready",
+      });
+    }
+  }
+
+  const columns = ["resource", "id", "title", "artist", "release", "status"];
+  const csv = [columns.join(",")]
+    .concat(
+      rows.map((row) =>
+        columns
+          .map((key) => {
+            const value = row[key] ?? "";
+            const text = String(value).replace(/"/g, '""');
+            return `"${text}"`;
+          })
+          .join(","),
+      ),
+    )
+    .join("\n");
+
+  downloadTextFile("strezless-nexus-catalog.csv", csv, "text/csv;charset=utf-8;");
+}
+
+// ---------- API ----------
+
+async function api<T = any>(path: string, init: RequestInit = {}): Promise<T> {
+  const res = await fetch(`/api/${path}`, {
+    ...init,
+    credentials: "same-origin",
+    headers: { "Content-Type": "application/json", ...init.headers },
+  });
+  if (res.status === 401) {
+    state.user = null;
+    render();
+    throw new Error("Your session expired. Please log in again.");
+  }
+  if (!res.ok) {
+    const body = await res.json().catch(() => null);
+    throw new Error(body?.error ?? `Request failed (${res.status})`);
+  }
+  return res.status === 204 ? (null as T) : res.json();
+}
+
+async function loadAll() {
+  const [artists, releases, tracks] = await Promise.all([api<Row[]>("artists"), api<Row[]>("releases"), api<Row[]>("tracks")]);
+  state.data = { artists, releases, tracks };
+  state.loaded = true;
+}
+
+// ---------- auth views ----------
+
+type AuthMode = "login" | "signup" | "forgot" | "reset";
+
+function renderAuth(mode: AuthMode = "login", notice = "") {
+  const titles: Record<AuthMode, string> = {
+    login: "Welcome back",
+    signup: "Create your hub",
+    forgot: "Reset password",
+    reset: "Choose a new password",
+  };
+
+  app.innerHTML = `
+    <main class="auth">
+      <section class="auth-hero">
+        <div class="brand">Strezless Nexus</div>
+        <div>
+          <h1>Your catalog,<br/><em>properly coded.</em></h1>
+          <p>One place for indie artists to keep every identifier straight — so royalties, credits and distribution land where they should.</p>
+          <div class="codes"><span>IPI</span><span>ISNI</span><span>ISRC</span><span>ISWC</span><span>UPC</span><span>PRO</span></div>
+        </div>
+        <p class="hint">Each account's catalog is private to that account.</p>
+      </section>
+      <section class="auth-panel">
+        <form class="auth-card" id="auth-form" novalidate>
+          ${
+            mode === "login" || mode === "signup"
+              ? `<div class="tabs">
+                  <button type="button" data-mode="login" class="${mode === "login" ? "active" : ""}">Log in</button>
+                  <button type="button" data-mode="signup" class="${mode === "signup" ? "active" : ""}">Sign up</button>
+                </div>`
+              : ""
+          }
+          <h2>${titles[mode]}</h2>
+          ${notice ? `<div class="msg info">${esc(notice)}</div>` : ""}
+          <div class="msg error" id="auth-error" hidden></div>
+          ${mode === "signup" ? `<label>Artist or full name<input name="name" autocomplete="name" required /></label>` : ""}
+          ${mode !== "reset" ? `<label>Email<input name="email" type="email" autocomplete="email" required /></label>` : ""}
+          ${
+            mode !== "forgot"
+              ? `<label>${mode === "reset" ? "New password" : "Password"}<input name="password" type="password" autocomplete="${
+                  mode === "login" ? "current-password" : "new-password"
+                }" required minlength="6" /></label>`
+              : ""
+          }
+          <button class="primary" type="submit">${
+            { login: "Log in", signup: "Create account", forgot: "Send reset link", reset: "Save password" }[mode]
+          }</button>
+          ${mode === "login" ? `<button type="button" class="linkish" data-mode="forgot">Forgot your password?</button>` : ""}
+          ${mode === "forgot" ? `<button type="button" class="linkish" data-mode="login">Back to log in</button>` : ""}
+        </form>
+      </section>
+    </main>`;
+
+  app.querySelectorAll<HTMLButtonElement>("[data-mode]").forEach((b) =>
+    b.addEventListener("click", () => renderAuth(b.dataset.mode as AuthMode)),
+  );
+
+  const form = app.querySelector<HTMLFormElement>("#auth-form")!;
+  const errorBox = app.querySelector<HTMLDivElement>("#auth-error")!;
+  form.addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const fd = new FormData(form);
+    const email = String(fd.get("email") ?? "").trim();
+    const password = String(fd.get("password") ?? "");
+    const submit = form.querySelector<HTMLButtonElement>("button[type=submit]")!;
+    errorBox.hidden = true;
+    submit.disabled = true;
+    try {
+      if (mode === "login") {
+        state.user = await login(email, password);
+        await enterApp();
+      } else if (mode === "signup") {
+        const user = await signup(email, password, { full_name: String(fd.get("name") ?? "").trim() });
+        if (user.confirmedAt) {
+          state.user = user;
+          await enterApp();
+        } else {
+          renderAuth("login", "Check your inbox to confirm your email, then log in.");
+        }
+      } else if (mode === "forgot") {
+        await requestPasswordRecovery(email);
+        renderAuth("login", "If that email has an account, a reset link is on its way.");
+      } else {
+        await updateUser({ password });
+        state.user = await getUser();
+        await enterApp();
+      }
+    } catch (error) {
+      errorBox.textContent = authMessage(error);
+      errorBox.hidden = false;
+      submit.disabled = false;
+    }
+  });
+}
+
+// ---------- catalog views ----------
+
+function renderRow(resource: Resource, row: Row) {
+  const chips: string[] = [];
+  for (const [key, label] of KEY_CODES[resource]) {
+    chips.push(
+      row[key]
+        ? `<span class="chip"><b>${label}</b>${esc((FORMAT[key] ?? String)(row[key]))}</span>`
+        : `<span class="chip missing">No ${label}</span>`,
+    );
+  }
+
+  let title = row.title ?? row.name;
+  let sub: string[] = [];
+  if (resource === "artists") {
+    if (row.legalName) sub.push(row.legalName);
+    if (row.pro) chips.push(`<span class="chip"><b>PRO</b>${esc(row.pro)}</span>`);
+  } else if (resource === "releases") {
+    const artist = nameOf("artists", row.artistId);
+    if (artist) sub.push(artist);
+    sub.push(RELEASE_TYPES.find(([v]) => v === row.releaseType)?.[1] ?? row.releaseType);
+    if (row.releaseDate) sub.push(row.releaseDate);
+    if (row.label) sub.push(row.label);
+    const count = state.data.tracks.filter((t) => t.releaseId === row.id).length;
+    sub.push(`${count} track${count === 1 ? "" : "s"}`);
+    if (row.status) {
+      chips.push(`<span class="chip status-${row.status}"><b>Status</b>${esc(statusLabel(row.status))}</span>`);
+    }
+    if (row.territory) {
+      chips.push(`<span class="chip"><b>Terr.</b>${esc(TERRITORIES.find(([v]) => v === row.territory)?.[1] ?? row.territory)}</span>`);
+    }
+  } else {
+    const artist = nameOf("artists", row.artistId);
+    const release = nameOf("releases", row.releaseId);
+    if (artist) sub.push(artist);
+    if (release) sub.push(`from ${release}`);
+    if (row.durationSeconds != null) sub.push(fmtDuration(row.durationSeconds));
+    if (row.genre) sub.push(row.genre);
+    if (row.deliveryStatus) {
+      chips.push(`<span class="chip status-${row.deliveryStatus}"><b>Flow</b>${esc(statusLabel(row.deliveryStatus))}</span>`);
+    }
+    if (row.explicit) chips.push(`<span class="chip flag">E</span>`);
+  }
+
+  return `
+    <article class="row">
+      <div>
+        <h3>${esc(title)}</h3>
+        ${sub.length ? `<div class="sub">${sub.map(esc).join(" · ")}</div>` : ""}
+        <div class="chips">${chips.join("")}</div>
+      </div>
+      <div class="actions">
+        <button data-edit="${row.id}">Edit</button>
+        <button class="danger ghost" data-delete="${row.id}">Delete</button>
+      </div>
+    </article>`;
+}
+
+function renderApp() {
+  if (!state.user) return renderAuth();
+  const { tab, data, query } = state;
+  const displayName = state.user.name || state.user.email;
+  const totalMissing = missingCount("artists") + missingCount("releases") + missingCount("tracks");
+  const quality = summarizeQuality();
+  const ops = summarizeOperations();
+  const q = query.toLowerCase();
+  const rows = data[tab].filter((r) =>
+    !q ? true : Object.values(r).some((v) => typeof v === "string" && v.toLowerCase().includes(q)),
+  );
+  const [plural, singular] = LABELS[tab];
+
+  app.innerHTML = `
+    <div class="shell">
+      <header class="topbar">
+        <div class="brand">Strezless Nexus</div>
+        <div class="who">
+          <span>${esc(state.user.email)}</span>
+          <button class="ghost" id="logout">Log out</button>
+        </div>
+      </header>
+
+      <section class="hello">
+        <h1>${esc(displayName?.split(" ")[0] ?? "Your")}'s catalog</h1>
+        <p>Keep the codes that collect your royalties complete and in one place.</p>
+      </section>
+
+      <section class="stats">
+        <div class="stat"><b>${data.artists.length}</b><span>Artists</span></div>
+        <div class="stat"><b>${data.releases.length}</b><span>Releases</span></div>
+        <div class="stat"><b>${data.tracks.length}</b><span>Tracks</span></div>
+        <div class="stat ${totalMissing ? "warn" : "good"}"><b>${totalMissing}</b><span>Missing codes</span></div>
+      </section>
+
+      <section class="quality-panel">
+        <div class="quality-header">
+          <div>
+            <p class="eyebrow">Metadata operations</p>
+            <h2>Release readiness</h2>
+          </div>
+          <div class="quality-actions">
+            <button class="ghost" id="export-ddex">Export DDEX</button>
+            <button class="ghost" id="export-csv">Export CSV</button>
+          </div>
+        </div>
+        <div class="quality-grid">
+          <div class="quality-card ${quality.blockers ? "warn" : "good"}"><b>${quality.readiness}%</b><span>Ready</span></div>
+          <div class="quality-card"><b>${quality.errors}</b><span>Errors</span></div>
+          <div class="quality-card"><b>${quality.warnings}</b><span>Warnings</span></div>
+          <div class="quality-card"><b>${quality.dspReadiness}%</b><span>DSP</span></div>
+          <div class="quality-card"><b>${quality.rightsReadiness}%</b><span>Rights</span></div>
+        </div>
+        <div class="quality-issues">
+          ${quality.issues.length ? quality.issues.slice(0, 5).map((issue) => `<div class="issue ${issue.severity}"><strong>${esc(issue.resource)}</strong><span>${esc(issue.message)}</span></div>`).join("") : `<div class="issue info"><strong>All clear</strong><span>No validation issues detected in the current catalog.</span></div>`}
+        </div>
+      </section>
+
+      <section class="ops-panel">
+        <div class="ops-header">
+          <h3>Release workflow</h3>
+          <span>${ops.totalReleases} releases in queue</span>
+        </div>
+        <div class="ops-grid">
+          <div class="ops-card draft"><strong>${ops.draft}</strong><span>Draft</span></div>
+          <div class="ops-card ready"><strong>${ops.readyForDistribution}</strong><span>Ready</span></div>
+          <div class="ops-card submitted"><strong>${ops.submitted}</strong><span>Submitted</span></div>
+          <div class="ops-card live"><strong>${ops.live}</strong><span>Live</span></div>
+        </div>
+      </section>
+
+      <section class="sync-panel">
+        <div class="sync-header">
+          <h3>Distribution pipeline</h3>
+        </div>
+        <div class="sync-grid">
+          ${DSP_TARGETS.map((target) => `<div class="sync-chip ${quality.blockers ? "needs-review" : "ready"}">${target}</div>`).join("")}
+        </div>
+      </section>
+
+      <nav class="nav">
+        ${(Object.keys(LABELS) as Resource[])
+          .map(
+            (r) =>
+              `<button class="tab ${r === tab ? "active" : ""}" data-tab="${r}">${LABELS[r][0]}${
+                missingCount(r) ? `<small>${missingCount(r)} missing</small>` : ""
+              }</button>`,
+          )
+          .join("")}
+        <span class="spacer"></span>
+        <input class="search" id="search" placeholder="Search ${plural.toLowerCase()}…" value="${esc(query)}" />
+        <button class="primary" id="add">+ Add ${singular}</button>
+      </nav>
+
+      <section class="list">
+        ${
+          rows.length
+            ? rows.map((r) => renderRow(tab, r)).join("")
+            : data[tab].length
+              ? `<div class="empty"><h3>No matches</h3>Nothing matches “${esc(query)}”.</div>`
+              : `<div class="empty"><h3>No ${plural.toLowerCase()} yet</h3>${
+                  tab === "tracks" && !data.artists.length
+                    ? "Tip: add your artist profile first so tracks can be credited."
+                    : `Add your first ${singular} to start building your catalog.`
+                }</div>`
+        }
+      </section>
+    </div>
+    <dialog id="editor"></dialog>`;
+
+  app.querySelector("#logout")!.addEventListener("click", async () => {
+    await logout().catch(() => {});
+    state.user = null;
+    state.loaded = false;
+    renderAuth();
+  });
+  app.querySelectorAll<HTMLButtonElement>("[data-tab]").forEach((b) =>
+    b.addEventListener("click", () => {
+      state.tab = b.dataset.tab as Resource;
+      state.query = "";
+      renderApp();
+    }),
+  );
+  const search = app.querySelector<HTMLInputElement>("#search")!;
+  search.addEventListener("input", () => {
+    state.query = search.value;
+    renderApp();
+    const next = app.querySelector<HTMLInputElement>("#search")!;
+    next.focus();
+    next.setSelectionRange(next.value.length, next.value.length);
+  });
+  app.querySelector("#add")!.addEventListener("click", () => openEditor(tab));
+  app.querySelectorAll<HTMLButtonElement>("[data-edit]").forEach((b) =>
+    b.addEventListener("click", () => openEditor(tab, data[tab].find((r) => r.id === Number(b.dataset.edit)))),
+  );
+  app.querySelectorAll<HTMLButtonElement>("[data-delete]").forEach((b) =>
+    b.addEventListener("click", () => removeRow(tab, Number(b.dataset.delete))),
+  );
+  app.querySelector("#export-ddex")?.addEventListener("click", exportDDEX);
+  app.querySelector("#export-csv")?.addEventListener("click", exportCsv);
+}
+
+function fieldHtml(field: Field, value: any) {
+  const id = `f-${field.name}`;
+  const req = field.required ? "required" : "";
+  const cls = field.full ? "full" : "";
+  const hint = field.hint ? `<span class="hint">${esc(field.hint)}</span>` : "";
+  const ph = field.placeholder ? `placeholder="${esc(field.placeholder)}"` : "";
+
+  switch (field.type) {
+    case "checkbox":
+      return `<label class="check ${cls}"><input type="checkbox" name="${field.name}" ${value ? "checked" : ""} /> ${esc(field.label)}</label>`;
+    case "textarea":
+      return `<label class="${cls}">${esc(field.label)}<textarea id="${id}" name="${field.name}" ${ph}>${esc(value)}</textarea>${hint}</label>`;
+    case "select":
+    case "artist":
+    case "release": {
+      const options: [string, string][] =
+        field.type === "select"
+          ? field.options!
+          : [
+              ["", "— None —"],
+              ...state.data[field.type === "artist" ? "artists" : "releases"].map(
+                (r): [string, string] => [String(r.id), r.name ?? r.title],
+              ),
+            ];
+      return `<label class="${cls}">${esc(field.label)}<select id="${id}" name="${field.name}">${options
+        .map(([v, l]) => `<option value="${esc(v)}" ${String(value ?? "") === v ? "selected" : ""}>${esc(l)}</option>`)
+        .join("")}</select>${hint}</label>`;
+    }
+    default: {
+      const type = field.type === "date" ? "date" : field.type === "number" ? "number" : "text";
+      const shown = value != null && FORMAT[field.name] ? FORMAT[field.name](value) : value;
+      return `<label class="${cls}">${esc(field.label)}<input id="${id}" name="${field.name}" type="${type}" ${
+        field.type === "number" ? 'min="0" step="1"' : ""
+      } class="${field.type === "code" ? "code" : ""}" value="${esc(shown)}" ${ph} ${req} />${hint}</label>`;
+    }
+  }
+}
+
+function openEditor(resource: Resource, row?: Row) {
+  const dialog = app.querySelector<HTMLDialogElement>("#editor")!;
+  const singular = LABELS[resource][1];
+  dialog.innerHTML = `
+    <form method="dialog" id="editor-form" novalidate>
+      <h2>${row ? "Edit" : "New"} ${singular}</h2>
+      <div class="msg error" id="editor-error" hidden></div>
+      <div class="grid2">${FIELDS[resource].map((f) => fieldHtml(f, row?.[f.name])).join("")}</div>
+      <div class="dialog-actions">
+        <button type="button" class="ghost" id="cancel">Cancel</button>
+        <button type="submit" class="primary">${row ? "Save changes" : `Add ${singular}`}</button>
+      </div>
+    </form>`;
+  dialog.showModal();
+  dialog.querySelector<HTMLInputElement>("input, textarea")?.focus();
+  dialog.querySelector("#cancel")!.addEventListener("click", () => dialog.close());
+
+  const form = dialog.querySelector<HTMLFormElement>("#editor-form")!;
+  const errorBox = dialog.querySelector<HTMLDivElement>("#editor-error")!;
+  form.addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const body: Record<string, unknown> = {};
+    for (const f of FIELDS[resource]) {
+      const el = form.elements.namedItem(f.name) as HTMLInputElement;
+      body[f.name] = f.type === "checkbox" ? el.checked : el.value;
+    }
+    const submit = form.querySelector<HTMLButtonElement>("button[type=submit]")!;
+    submit.disabled = true;
+    errorBox.hidden = true;
+    try {
+      const saved = await api<Row>(row ? `${resource}/${row.id}` : resource, {
+        method: row ? "PUT" : "POST",
+        body: JSON.stringify(body),
+      });
+      const list = state.data[resource];
+      state.data[resource] = row ? list.map((r) => (r.id === saved.id ? saved : r)) : [saved, ...list];
+      dialog.close();
+      renderApp();
+    } catch (error) {
+      errorBox.textContent = (error as Error).message;
+      errorBox.hidden = false;
+      submit.disabled = false;
+    }
+  });
+}
+
+async function removeRow(resource: Resource, id: number) {
+  const row = state.data[resource].find((r) => r.id === id);
+  if (!row || !confirm(`Delete “${row.name ?? row.title}”? This can't be undone.`)) return;
+  try {
+    await api(`${resource}/${id}`, { method: "DELETE" });
+    await loadAll();
+    renderApp();
+  } catch (error) {
+    alert((error as Error).message);
+  }
+}
+
+// ---------- boot ----------
+
+async function enterApp() {
+  app.innerHTML = `<p class="boot">Loading your catalog…</p>`;
+  try {
+    await loadAll();
+    renderApp();
+  } catch (error) {
+    if (state.user) app.innerHTML = `<p class="boot">${esc((error as Error).message)}</p>`;
+  }
+}
+
+function render() {
+  if (state.user) renderApp();
+  else renderAuth();
+}
+
+async function boot() {
+  try {
+    const result = await handleAuthCallback();
+    if (result?.type === "recovery") return renderAuth("reset", "You're verified. Set a new password to continue.");
+    if (result?.type === "confirmation") {
+      state.user = result.user;
+      return enterApp();
+    }
+  } catch (error) {
+    renderAuth("login", authMessage(error));
+    return;
+  }
+
+  state.user = await getUser();
+  if (state.user) await enterApp();
+  else renderAuth();
+
+  onAuthChange((event, user) => {
+    if (event === "logout" && state.user) {
+      state.user = null;
+      state.loaded = false;
+      renderAuth();
+    } else if (event === "login" && user && !state.user) {
+      state.user = user;
+      enterApp();
+    }
+  });
+}
+
+boot();
+

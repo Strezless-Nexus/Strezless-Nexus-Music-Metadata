@@ -26,6 +26,14 @@ type Field = {
   options?: [string, string][];
 };
 
+type QualityIssue = {
+  resource: Resource;
+  rowId: number | null;
+  title: string;
+  message: string;
+  severity: "error" | "warning" | "info";
+};
+
 const app = document.querySelector<HTMLDivElement>("#app")!;
 
 const state = {
@@ -37,7 +45,7 @@ const state = {
 };
 
 const esc = (v: unknown) =>
-  String(v ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]!);
+  String(v ?? "").replace(/[&<>\"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]!);
 
 const authMessage = (error: unknown) => {
   if (error instanceof MissingIdentityError) return "Accounts aren't available here yet. Try again on the deployed site.";
@@ -117,6 +125,191 @@ const nameOf = (resource: Resource, id: number | null) => {
 
 const missingCount = (resource: Resource) =>
   state.data[resource].reduce((n, row) => n + KEY_CODES[resource].filter(([k]) => !row[k]).length, 0);
+
+const normalizeValue = (value: unknown) => String(value ?? "").trim();
+const normalizeCode = (value: unknown) => normalizeValue(value).replace(/[\s.\-]/g, "").toUpperCase();
+
+function parseWriterSplits(value: unknown): number[] {
+  const text = normalizeValue(value);
+  if (!text) return [];
+  const matches = [...text.matchAll(/(\d+(?:\.\d+)?)\s*%/g)];
+  if (!matches.length) return [];
+  return matches.map((match) => Number(match[1]));
+}
+
+function validateArtist(row: Row): QualityIssue[] {
+  const issues: QualityIssue[] = [];
+  if (!row.name) issues.push({ resource: "artists", rowId: row.id, title: row.name ?? "Unnamed artist", message: "Artist name is required.", severity: "error" });
+  if (row.ipi && !/^\d{9,11}$/.test(normalizeCode(row.ipi))) {
+    issues.push({ resource: "artists", rowId: row.id, title: row.name ?? "Unnamed artist", message: "IPI should be 9-11 digits.", severity: "error" });
+  }
+  if (row.isni && !/^\d{15}[\dX]$/.test(normalizeCode(row.isni))) {
+    issues.push({ resource: "artists", rowId: row.id, title: row.name ?? "Unnamed artist", message: "ISNI should be 16 characters with digits/X.", severity: "error" });
+  }
+  if (row.spotifyUrl && !/^https?:\/\/.*spotify.*$/i.test(row.spotifyUrl)) {
+    issues.push({ resource: "artists", rowId: row.id, title: row.name ?? "Unnamed artist", message: "Spotify URL looks malformed.", severity: "warning" });
+  }
+  return issues;
+}
+
+function validateRelease(row: Row): QualityIssue[] {
+  const issues: QualityIssue[] = [];
+  if (!row.title) issues.push({ resource: "releases", rowId: row.id, title: row.title ?? "Untitled release", message: "Release title is required.", severity: "error" });
+  if (row.upc && !/^\d{12,13}$/.test(normalizeCode(row.upc))) {
+    issues.push({ resource: "releases", rowId: row.id, title: row.title ?? "Untitled release", message: "UPC/EAN should contain 12 or 13 digits.", severity: "error" });
+  }
+  if (row.releaseDate && !/^\d{4}-\d{2}-\d{2}$/.test(String(row.releaseDate))) {
+    issues.push({ resource: "releases", rowId: row.id, title: row.title ?? "Untitled release", message: "Release date should use YYYY-MM-DD.", severity: "error" });
+  }
+  return issues;
+}
+
+function validateTrack(row: Row): QualityIssue[] {
+  const issues: QualityIssue[] = [];
+  if (!row.title) issues.push({ resource: "tracks", rowId: row.id, title: row.title ?? "Untitled track", message: "Track title is required.", severity: "error" });
+  if (row.isrc && !/^[A-Z]{2}[A-Z0-9]{3}\d{7}$/.test(normalizeCode(row.isrc))) {
+    issues.push({ resource: "tracks", rowId: row.id, title: row.title ?? "Untitled track", message: "ISRC format is invalid.", severity: "error" });
+  }
+  if (row.iswc && !/^T\d{10}$/.test(normalizeCode(row.iswc))) {
+    issues.push({ resource: "tracks", rowId: row.id, title: row.title ?? "Untitled track", message: "ISWC format is invalid.", severity: "error" });
+  }
+  if (row.durationSeconds != null && (!Number.isFinite(Number(row.durationSeconds)) || Number(row.durationSeconds) < 0)) {
+    issues.push({ resource: "tracks", rowId: row.id, title: row.title ?? "Untitled track", message: "Duration must be a non-negative number of seconds.", severity: "error" });
+  }
+  const writerSplits = parseWriterSplits(row.writers);
+  if (writerSplits.length) {
+    const total = writerSplits.reduce((sum, value) => sum + value, 0);
+    if (Math.abs(total - 100) > 0.001) {
+      issues.push({ resource: "tracks", rowId: row.id, title: row.title ?? "Untitled track", message: "Writer split total should equal 100%.", severity: "warning" });
+    }
+  }
+  return issues;
+}
+
+function summarizeQuality(): {
+  issues: QualityIssue[];
+  total: number;
+  errors: number;
+  warnings: number;
+  readiness: number;
+  blockers: number;
+} {
+  const issues: QualityIssue[] = [];
+  for (const resource of ["artists", "releases", "tracks"] as Resource[]) {
+    for (const row of state.data[resource]) {
+      if (resource === "artists") issues.push(...validateArtist(row));
+      if (resource === "releases") issues.push(...validateRelease(row));
+      if (resource === "tracks") issues.push(...validateTrack(row));
+    }
+  }
+
+  const errors = issues.filter((issue) => issue.severity === "error").length;
+  const warnings = issues.filter((issue) => issue.severity === "warning").length;
+  const total = issues.length;
+  const totalRows = state.data.artists.length + state.data.releases.length + state.data.tracks.length;
+  const readiness = totalRows === 0 ? 100 : Math.max(0, Math.min(100, Math.round(((totalRows * 3 - total) / (totalRows * 3)) * 100)));
+
+  return { issues, total, errors, warnings, readiness, blockers: errors };
+}
+
+function exportDDEXBundle() {
+  const quality = summarizeQuality();
+  return {
+    schemaVersion: "1.0",
+    messageType: "ReleaseNotification",
+    createdAt: new Date().toISOString(),
+    source: "Strezless Nexus",
+    validation: {
+      readiness: quality.readiness,
+      totalIssues: quality.total,
+      errors: quality.errors,
+      warnings: quality.warnings,
+      blockers: quality.blockers,
+    },
+    artists: state.data.artists.map((artist) => ({
+      id: artist.id,
+      name: artist.name,
+      legalName: artist.legalName ?? null,
+      ipi: artist.ipi ?? null,
+      isni: artist.isni ?? null,
+      pro: artist.pro ?? null,
+      spotifyUrl: artist.spotifyUrl ?? null,
+      appleMusicUrl: artist.appleMusicUrl ?? null,
+      bio: artist.bio ?? null,
+    })),
+    releases: state.data.releases.map((release) => ({
+      id: release.id,
+      title: release.title,
+      artistId: release.artistId ?? null,
+      releaseType: release.releaseType ?? "single",
+      upc: release.upc ?? null,
+      label: release.label ?? null,
+      releaseDate: release.releaseDate ?? null,
+    })),
+    tracks: state.data.tracks.map((track) => ({
+      id: track.id,
+      title: track.title,
+      artistId: track.artistId ?? null,
+      releaseId: track.releaseId ?? null,
+      isrc: track.isrc ?? null,
+      iswc: track.iswc ?? null,
+      durationSeconds: track.durationSeconds ?? null,
+      genre: track.genre ?? null,
+      writers: track.writers ?? null,
+      explicit: Boolean(track.explicit),
+    })),
+  };
+}
+
+function downloadTextFile(filename: string, content: string, type: string) {
+  const blob = new Blob([content], { type });
+  const url = URL.createObjectURL(blob);
+  const anchor = document.createElement("a");
+  anchor.href = url;
+  anchor.download = filename;
+  document.body.appendChild(anchor);
+  anchor.click();
+  anchor.remove();
+  URL.revokeObjectURL(url);
+}
+
+function exportDDEX() {
+  const payload = exportDDEXBundle();
+  downloadTextFile("strezless-nexus-ddex.json", JSON.stringify(payload, null, 2), "application/json");
+}
+
+function exportCsv() {
+  const rows: Array<Record<string, string | number | null>> = [];
+  for (const resource of ["artists", "releases", "tracks"] as Resource[]) {
+    for (const row of state.data[resource]) {
+      rows.push({
+        resource,
+        id: row.id,
+        title: row.title ?? row.name ?? "",
+        artist: row.artistId ? (nameOf("artists", row.artistId) ?? "") : "",
+        release: row.releaseId ? (nameOf("releases", row.releaseId) ?? "") : "",
+        status: summarizeQuality().blockers > 0 ? "needs-review" : "ready",
+      });
+    }
+  }
+
+  const columns = ["resource", "id", "title", "artist", "release", "status"];
+  const csv = [columns.join(",")]
+    .concat(
+      rows.map((row) =>
+        columns
+          .map((key) => {
+            const value = row[key] ?? "";
+            const text = String(value).replace(/"/g, '""');
+            return `"${text}"`;
+          })
+          .join(","),
+      ),
+    )
+    .join("\n");
+
+  downloadTextFile("strezless-nexus-catalog.csv", csv, "text/csv;charset=utf-8;");
+}
 
 // ---------- API ----------
 
@@ -294,6 +487,7 @@ function renderApp() {
   const { tab, data, query } = state;
   const displayName = state.user.name || state.user.email;
   const totalMissing = missingCount("artists") + missingCount("releases") + missingCount("tracks");
+  const quality = summarizeQuality();
   const q = query.toLowerCase();
   const rows = data[tab].filter((r) =>
     !q ? true : Object.values(r).some((v) => typeof v === "string" && v.toLowerCase().includes(q)),
@@ -320,6 +514,28 @@ function renderApp() {
         <div class="stat"><b>${data.releases.length}</b><span>Releases</span></div>
         <div class="stat"><b>${data.tracks.length}</b><span>Tracks</span></div>
         <div class="stat ${totalMissing ? "warn" : "good"}"><b>${totalMissing}</b><span>Missing codes</span></div>
+      </section>
+
+      <section class="quality-panel">
+        <div class="quality-header">
+          <div>
+            <p class="eyebrow">Metadata operations</p>
+            <h2>Release readiness</h2>
+          </div>
+          <div class="quality-actions">
+            <button class="ghost" id="export-ddex">Export DDEX</button>
+            <button class="ghost" id="export-csv">Export CSV</button>
+          </div>
+        </div>
+        <div class="quality-grid">
+          <div class="quality-card ${quality.blockers ? "warn" : "good"}"><b>${quality.readiness}%</b><span>Ready</span></div>
+          <div class="quality-card"><b>${quality.errors}</b><span>Errors</span></div>
+          <div class="quality-card"><b>${quality.warnings}</b><span>Warnings</span></div>
+          <div class="quality-card"><b>${quality.total}</b><span>Checks</span></div>
+        </div>
+        <div class="quality-issues">
+          ${quality.issues.length ? quality.issues.slice(0, 5).map((issue) => `<div class="issue ${issue.severity}"><strong>${esc(issue.resource)}</strong><span>${esc(issue.message)}</span></div>`).join("") : `<div class="issue info"><strong>All clear</strong><span>No validation issues detected in the current catalog.</span></div>`}
+        </div>
       </section>
 
       <nav class="nav">
@@ -380,6 +596,8 @@ function renderApp() {
   app.querySelectorAll<HTMLButtonElement>("[data-delete]").forEach((b) =>
     b.addEventListener("click", () => removeRow(tab, Number(b.dataset.delete))),
   );
+  app.querySelector("#export-ddex")?.addEventListener("click", exportDDEX);
+  app.querySelector("#export-csv")?.addEventListener("click", exportCsv);
 }
 
 function fieldHtml(field: Field, value: any) {
@@ -471,7 +689,6 @@ async function removeRow(resource: Resource, id: number) {
   if (!row || !confirm(`Delete “${row.name ?? row.title}”? This can't be undone.`)) return;
   try {
     await api(`${resource}/${id}`, { method: "DELETE" });
-    // Linked items keep existing but lose the reference, matching the database behavior.
     await loadAll();
     renderApp();
   } catch (error) {
@@ -526,3 +743,4 @@ async function boot() {
 }
 
 boot();
+

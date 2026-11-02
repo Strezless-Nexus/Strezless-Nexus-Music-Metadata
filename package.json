@@ -2,10 +2,23 @@
   "name": "strezless-nexus-music-metadata",
   "version": "1.0.0",
   "description": "A music metadata management system",
-  "main": "index.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "dev": "vite",
+    "build": "vite build",
+    "db:generate": "drizzle-kit generate"
   },
   "author": "Sin-Estres-Orrantia",
-  "license": "ISC"
+  "license": "ISC",
+  "dependencies": {
+    "@netlify/database": "^2.0.1",
+    "@netlify/identity": "^2.0.0",
+    "drizzle-orm": "^1.0.0-beta.22"
+  },
+  "devDependencies": {
+    "@netlify/functions": "^6.0.3",
+    "drizzle-kit": "^1.0.0-beta.22",
+    "typescript": "^7.0.2",
+    "vite": "^8.3.5"
+  },
+  "type": "module"
 }
